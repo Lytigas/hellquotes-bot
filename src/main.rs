@@ -1,13 +1,16 @@
 use anyhow as ah;
 use argh::FromArgs;
+use async_shutdown::Shutdown;
 use once_cell::sync::OnceCell;
 use poise::{
-    serenity_prelude::{self as serenity, CacheHttp},
+    serenity_prelude::{self as serenity, ChannelId},
     FrameworkError,
 };
-use reqwest::header::HeaderValue;
 use rusqlite as sql;
 use sql::OptionalExtension;
+use tokio::sync::mpsc;
+
+mod watcher;
 
 #[derive(FromArgs)]
 /// Reach new heights.
@@ -20,6 +23,8 @@ struct Args {
 struct Config {
     token: String,
     db_path: String,
+    quotes_channel_id: u64,
+    quotes_db_path: String,
 }
 
 fn get_config() -> &'static Config {
@@ -34,9 +39,16 @@ fn get_config() -> &'static Config {
             token: config
                 .get("default", "token")
                 .expect("Config: token must be specified."),
+            quotes_channel_id: config
+                .getuint("default", "quotes_channel_id")
+                .expect("channel id must be u64")
+                .expect("Config: quotes_channel_id required"),
             db_path: config
                 .get("default", "db_file")
                 .expect("Config: db_file must be specified"),
+            quotes_db_path: config
+                .get("default", "quotes_db_path")
+                .expect("Config: quotes_db_path must be specified."),
         }
     })
 }
@@ -65,8 +77,17 @@ fn get_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| reqwest::Client::new())
 }
 
+#[derive(Debug, Clone)]
+struct Quote {
+    id: i64,
+    text: String,
+    tags: Option<String>,
+}
+
 #[derive(Debug)]
-struct Data();
+struct Data {
+    poll_tx: mpsc::Sender<()>,
+}
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
@@ -105,24 +126,28 @@ async fn register(
     Ok(())
 }
 
-/// Returns the URL if the header is canonical, otherwise None
-fn get_url_from_header(h: &HeaderValue) -> Option<&str> {
-    let s = h.to_str().ok()?;
-    // Doesn't actually parse rel, but that's probably fine
-    if !s.contains("canonical") {
-        return None;
-    }
-    let a = s.find('<')?;
-    let b = s.find('>')?;
-    // Also doesn't handle quoting, shouldnt matter since we only display the url
-    s.get(a + 1..b)
+fn quote_help() -> String {
+    String::from(
+        "\
+Accessible via /quote or ~quote, in the server or in DMs. ~quote will show to
+other people in the server. Usually, people don't see who submits hellquotes, so
+consider using /quote or ~quote in DMs. ~quote is the only way to write multiple
+lines. To add tags, prefix tag:[tag] as many times as you want, separated by
+spaces.
+
+Example usage:
+~quote tag:anon tag:blacker my awesome quote
+
+-anonymous",
+    )
 }
 
-/// Send a quote. For multiline usage, use ~quote instead of /quote.
-#[poise::command(slash_command, prefix_command, guild_only)]
+/// Send a quote. For multiple lines, use ~quote not /quote. For anonymity, use /quote or DMs.
+#[poise::command(slash_command, prefix_command, help_text_fn = "quote_help")]
 async fn quote(
     ctx: Context<'_>,
     #[description = "quote text, preceeded by zero or more space-separated \"tag:[tag]\"s"]
+    #[rest]
     text: String,
 ) -> Result<(), Error> {
     let mut tag_string = String::new();
@@ -165,8 +190,7 @@ async fn quote(
         ))?;
 
     let response = get_client()
-        // .post("https://blacker.caltech.edu/quotes/")
-        .post("https://webhook.site/a34dd23a-3cd4-4134-924d-6f4712f277d2")
+        .post("https://blacker.caltech.edu/quotes/")
         .basic_auth(user, Some(pass))
         .form(&[("quote", quote), ("tags", &tag_string)])
         .send()
@@ -174,30 +198,47 @@ async fn quote(
     if !response.status().is_success() {
         return Err(ah::anyhow!("Hellquotes gave status: {}", response.status()).into());
     }
-    let url = response
-        .headers()
-        .get_all(reqwest::header::LINK)
-        .iter()
-        .filter_map(get_url_from_header)
-        .next()
-        .unwrap_or("No valid link found in response");
 
-    // if this is a quote, send an invisible reply so that we don't get a
+    // if this is a slash cmd, send an invisible reply so that we don't get a
     // "no response" error message sent to the user
     if let Context::Application(actx) = ctx {
         poise::reply::send_application_reply(actx, |cr| cr.content("Success.").ephemeral(true))
             .await?;
     };
 
-    ctx.channel_id()
-        .send_message(ctx.http(), |msg| {
-            msg.content(format!(
-                "Quote submitted. Text:\n{}\n\nTags: {}\nView on titanic: {}",
-                quote, tag_string, url
-            ))
+    // prompt quote watcher to check for the newly submitted quote so it shows
+    // up faster
+    ctx.data().poll_tx.try_send(()).ok();
+
+    Ok(())
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        None => s,
+        Some((idx, _)) => &s[..idx],
+    }
+}
+
+async fn send_quote(quote: &Quote, http: &serenity::Http) -> ah::Result<()> {
+    // truncate quote text to ensure message is under 2000 chars
+    let text = truncate_str(&quote.text, 1600);
+    let tags = truncate_str(quote.tags.as_ref().map(String::as_str).unwrap_or(""), 200);
+
+    ChannelId::from(get_config().quotes_channel_id)
+        .send_message(http, |msg| {
+            msg.embed(|embed| {
+                embed
+                    .title(text)
+                    .description(format!(
+                        "[View on Titanic](https://blacker.caltech.edu/quotes/?q={})",
+                        quote.id
+                    ))
+                    .color(0)
+                    .footer(|footer| footer.text(format!("Tags: {}", tags)))
+            })
         })
         .await?;
-
     Ok(())
 }
 
@@ -207,7 +248,7 @@ async fn help(
     #[description = "Specific command to show help about"] command: Option<String>,
 ) -> Result<(), Error> {
     let config = poise::builtins::HelpConfiguration {
-        extra_text_at_bottom: "Type ?help command for more info on a command.",
+        extra_text_at_bottom: "Type /help command for more info on a command.",
         ..Default::default()
     };
     poise::builtins::help(ctx, command.as_deref(), config).await?;
@@ -251,7 +292,23 @@ async fn on_error(e: FrameworkError<'_, Data, Error>) {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> ah::Result<()> {
+    let shutdown = Shutdown::new();
+    let shutdown_ = shutdown.clone();
+    // Spawn a task to wait for CTRL+C and trigger a shutdown.
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                eprintln!("Failed to wait for CTRL+C: {}", e);
+                std::process::exit(1);
+            } else {
+                eprintln!("\nReceived interrupt signal. Shutting down server...");
+                shutdown.shutdown();
+            }
+        }
+    });
+
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![register(), quote(), help()],
@@ -273,8 +330,30 @@ async fn main() {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                Ok(Data {})
+                eprintln!("Bot setup complete.");
+
+                let quote_db_path = &get_config().quotes_db_path;
+
+                let (poll_tx, poller_task) =
+                    watcher::create_poller(ctx.http.clone(), quote_db_path, shutdown_.clone())?;
+                tokio::spawn(shutdown_.wrap_cancel(poller_task));
+
+                let fs_watcher = watcher::configure_fs_watcher(poll_tx.clone(), quote_db_path)?;
+                // de-allocate the watcher when we're done using a never-finishing task
+                let watcher_task = async move {
+                    let _fs_watcher = fs_watcher;
+                    let () = std::future::pending().await;
+                };
+                tokio::spawn(shutdown_.wrap_cancel(watcher_task));
+
+                Ok(Data { poll_tx })
             })
         });
-    framework.run().await.unwrap();
+    let bot_run = framework.run();
+    let bot_run = shutdown.wrap_vital(shutdown.wrap_cancel(bot_run));
+    match bot_run.await {
+        None => return Err(ah::anyhow!("Main bot loop cancelled by shutdown.")),
+        Some(Err(e)) => return Err(e.into()),
+        Some(Ok(_)) => unreachable!(), // bot loop never exits
+    }
 }
