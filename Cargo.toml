@@ -16,6 +16,8 @@ anyhow = "1.0.69"
 reqwest = { version = "0.11.14", features = ["rustls-tls"], default-features = false }
 async-shutdown = "0.1.2"
 notify = { version = "5.1.0", default-features = false, features = ["macos_kqueue"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [profile.release]
 lto = true

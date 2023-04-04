@@ -9,6 +9,7 @@ use poise::{
 use rusqlite as sql;
 use sql::OptionalExtension;
 use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 mod watcher;
 
@@ -221,6 +222,7 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
 }
 
 async fn send_quote(quote: &Quote, http: &serenity::Http) -> ah::Result<()> {
+    info!(id = quote.id, "Submitting quote to discord");
     // truncate quote text to ensure message is under 2000 chars
     let text = truncate_str(&quote.text, 1600);
     let tags = truncate_str(quote.tags.as_ref().map(String::as_str).unwrap_or(""), 200);
@@ -258,12 +260,12 @@ async fn help(
 async fn on_error(e: FrameworkError<'_, Data, Error>) {
     use FrameworkError::*;
     match e {
-        Setup { error, .. } => eprintln!("Setup failed: {}", error),
-        EventHandler { error, .. } => eprintln!("Error during event handler: {}", error),
+        Setup { error, .. } => error!("Setup failed: {}", error),
+        EventHandler { error, .. } => error!("Error during event handler: {}", error),
         Command { error, ctx } => {
             let user_error_msg = error.to_string();
             if let Err(e) = poise::say_reply(ctx, user_error_msg).await {
-                eprintln!("Error while user command error: {}", e);
+                error!("Error while user command error: {}", e);
             }
         }
         ArgumentParse { error, ctx, .. } => {
@@ -273,26 +275,28 @@ async fn on_error(e: FrameworkError<'_, Data, Error>) {
             }
             let user_error_msg = format!("**{}**\n{}", error, usage);
             if let Err(e) = poise::say_reply(ctx, user_error_msg).await {
-                eprintln!("Error while user command error: {}", e);
+                error!("Error while user command error: {}", e);
             }
         }
         GuildOnly { ctx } => {
             if let Err(e) = poise::say_reply(ctx, "Command is only allowed in servers!").await {
-                eprintln!("Error while user command error: {}", e);
+                error!("Error while user command error: {}", e);
             }
         }
         DmOnly { ctx } => {
             if let Err(e) = poise::say_reply(ctx, "Command is only allowed in DM").await {
-                eprintln!("Error while user command error: {}", e);
+                error!("Error while user command error: {}", e);
             }
         }
-        UnknownCommand { .. } => eprintln!("Somehow got an unknown command error?"),
-        _ => eprintln!("UNHANDLED ERROR OCCURRED: {:?}", e),
+        UnknownCommand { .. } => error!("Somehow got an unknown command error?"),
+        _ => error!("UNHANDLED ERROR OCCURRED: {:?}", e),
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ah::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let shutdown = Shutdown::new();
     let shutdown_ = shutdown.clone();
     // Spawn a task to wait for CTRL+C and trigger a shutdown.
@@ -300,10 +304,10 @@ async fn main() -> ah::Result<()> {
         let shutdown = shutdown.clone();
         async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
-                eprintln!("Failed to wait for CTRL+C: {}", e);
+                error!("Failed to wait for CTRL+C: {}", e);
                 std::process::exit(1);
             } else {
-                eprintln!("\nReceived interrupt signal. Shutting down server...");
+                warn!("\nReceived interrupt signal. Shutting down server...");
                 shutdown.shutdown();
             }
         }
@@ -330,13 +334,15 @@ async fn main() -> ah::Result<()> {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                eprintln!("Bot setup complete.");
+                info!("Bot setup complete.");
 
                 let quote_db_path = &get_config().quotes_db_path;
 
                 let (poll_tx, poller_task) =
                     watcher::create_poller(ctx.http.clone(), quote_db_path, shutdown_.clone())?;
-                tokio::spawn(shutdown_.wrap_cancel(poller_task));
+                let poller_task = shutdown_.wrap_vital(poller_task);
+                let poller_task = shutdown_.wrap_cancel(poller_task);
+                tokio::spawn(poller_task);
 
                 let fs_watcher = watcher::configure_fs_watcher(poll_tx.clone(), quote_db_path)?;
                 // de-allocate the watcher when we're done using a never-finishing task
@@ -352,7 +358,7 @@ async fn main() -> ah::Result<()> {
     let bot_run = framework.run();
     let bot_run = shutdown.wrap_vital(shutdown.wrap_cancel(bot_run));
     match bot_run.await {
-        None => return Err(ah::anyhow!("Main bot loop cancelled by shutdown.")),
+        None => return Ok(info!("Main bot loop cancelled by shutdown.")),
         Some(Err(e)) => return Err(e.into()),
         Some(Ok(_)) => unreachable!(), // bot loop never exits
     }

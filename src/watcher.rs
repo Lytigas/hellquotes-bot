@@ -3,8 +3,9 @@ use async_shutdown::Shutdown;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use poise::serenity_prelude::Http;
 use rusqlite as sql;
-use std::ops::Deref;
-use tokio::sync::mpsc::{self, error::TrySendError};
+use std::{ops::Deref, time::Duration};
+use tokio::sync::mpsc;
+use tracing::{info, trace};
 
 use crate::{send_quote, Quote};
 
@@ -59,18 +60,12 @@ impl QuoteWatcher {
 }
 
 #[allow(dead_code)]
-pub async fn send_timed_checks(sender: mpsc::Sender<()>, shutdown: Shutdown) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(2500));
+pub async fn send_timed_checks(sender: mpsc::Sender<()>, dur: Duration) {
+    let mut interval = tokio::time::interval(dur);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        match sender.try_send(()) {
-            Err(TrySendError::Closed(())) => {
-                eprintln!("Watcher task receiver droppped. Assuming fatal watcher crash.");
-                shutdown.shutdown();
-            }
-            _ => (),
-        }
+        sender.try_send(()).ok();
     }
 }
 
@@ -82,6 +77,7 @@ pub fn configure_fs_watcher(
         // No error handling: a full queue means a flush is already pending,
         // a dropped queue means the app is shutting down.
         move |_res| {
+            info!("Notification triggered");
             sender.try_send(()).ok();
         },
         notify::Config::default(),
@@ -113,10 +109,12 @@ pub fn create_poller(
             let _shutdown_guard = poller_token;
             let mut watcher = QuoteWatcher::new(&db_path).expect("Couldn't create watcher");
             while let Some(()) = notify_rx.blocking_recv() {
+                trace!("Handling poll request");
                 for quote in watcher
                     .get_new_and_update_seen()
                     .expect("Couldn't poll quotes")
                 {
+                    info!(id = quote.id, "Poller handing off found quote.");
                     quote_tx.send(quote).expect("Couldn't send quote");
                 }
             }
