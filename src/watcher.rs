@@ -79,7 +79,11 @@ pub fn configure_fs_watcher(
     db_path: &str,
 ) -> ah::Result<RecommendedWatcher> {
     let mut watcher = RecommendedWatcher::new(
-        move |_res| sender.try_send(()).unwrap(),
+        // No error handling: a full queue means a flush is already pending,
+        // a dropped queue means the app is shutting down.
+        move |_res| {
+            sender.try_send(()).ok();
+        },
         notify::Config::default(),
     )?;
     watcher.watch(db_path.as_ref(), RecursiveMode::NonRecursive)?;
